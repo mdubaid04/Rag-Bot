@@ -11,6 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_community.document_loaders import PyPDFLoader
 from agent import rag_agent
 from vector_store import upload_doc
+import traceback
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -86,3 +87,119 @@ async def upload_document(file: UploadFile = File(...)):
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             print(f"Cleaned up temporary file: {temp_file_path}")
+
+
+@app.post('/chat/',response_model=AgentResponse)
+async def chat_with_agent(request:QueryRequest):
+    trace_event_for_frontend : List[TraceEvent] = []
+
+    try:
+        #* passing session and web info to the config so that agent can access it
+        config={
+            "configure":{
+                "thread_id":request.session_id,
+                "enable_web_search":request.enable_web_search
+            }
+        }
+        inputs={"messages":[HumanMessage(content=request.query)]}
+        final_message=" "
+
+        #* for server-side debugging--
+        print(f"Starting agent stream for session : {request.session_id}")
+        print(f"web_search_enable : {request.enable_web_search}")
+
+        #* to track each step of agent here i= step and s= dictionary
+        for i,s in enumerate(rag_agent.stream(inputs,config=config)):
+            current_node_name=None
+            node_output_state=None
+
+            if '__end__' in s:
+                current_node_name='__end__'
+                node_output_state=s['__end__']
+            else:
+                current_node_name=list[(s.keys())[0]] #8 s.keys() ek dict_keys object return krta hai i.e., dict_key(['retrieve])
+                node_output_state=s[current_node_name] 
+            event_discription=f"Execution Node : {current_node_name}"
+            event_details={}
+            event_type="generic node execution"
+            if current_node_name == "router":
+                route_decision = node_output_state.get('route')
+                # Check for overridden route if web search was disabled
+                initial_decision = node_output_state.get('initial_router_decision', route_decision)
+                override_reason = node_output_state.get('router_override_reason', None)
+
+                if override_reason:
+                    event_description = f"Router initially decided: '{initial_decision}'. Overridden to: '{route_decision}' because {override_reason}."
+                    event_details = {"initial_decision": initial_decision, "final_decision": route_decision, "override_reason": override_reason}
+                else:
+                    event_description = f"Router decided: '{route_decision}'"
+                    event_details = {"decision": route_decision, "reason": "Based on initial query analysis."}
+                event_type = "router_decision"
+            elif current_node_name == "rag_lookup":
+                rag_content_summary = node_output_state.get("rag", "")[:200] + "..."
+                
+                rag_sufficient = node_output_state.get("route") == "answer" 
+                
+                if rag_sufficient:
+                    event_description = f"RAG Lookup performed. Content found and deemed sufficient. Proceeding to answer."
+                    event_details = {"retrieved_content_summary": rag_content_summary, "sufficiency_verdict": "Sufficient"}
+                else:
+                    event_description = f"RAG Lookup performed. Content NOT sufficient. Diverting to web search."
+                    event_details = {"retrieved_content_summary": rag_content_summary, "sufficiency_verdict": "Not Sufficient"}
+                
+                event_type = "rag_action"
+            elif current_node_name == "web_search":
+                web_content_summary = node_output_state.get("web", "")[:200] + "..."
+                event_description = f"Web Search performed. Results retrieved. Proceeding to answer."
+                event_details = {"retrieved_content_summary": web_content_summary}
+                event_type = "web_action"
+            elif current_node_name == "answer":
+                event_description = "Generating final answer using gathered context."
+                event_type = "answer_generation"
+            elif current_node_name == "__end__":
+                event_description = "Agent process completed."
+                event_type = "process_end"
+
+            trace_event_for_frontend.append(
+                TraceEvent(
+                    step=i + 1,
+                    node_name=current_node_name,
+                    description=event_description,
+                    details=event_details,
+                    event_type=event_type
+                )
+            )
+            print(f"Streamed Event: Step {i+1} - Node: {current_node_name} - Desc: {event_description}")
+        
+         # Get the final state from the last yielded item in the stream
+        final_actual_state_dict = None
+        if s:
+            if '__end__' in s:
+                final_actual_state_dict = s['__end__']
+            else:
+                if list(s.keys()):
+                    final_actual_state_dict = s[list(s.keys())[0]]
+
+        if final_actual_state_dict and "messages" in final_actual_state_dict:
+            for msg in reversed(final_actual_state_dict["messages"]):
+                if isinstance(msg, AIMessage):
+                    final_message = msg.content
+                    break
+        
+        if not final_message:
+             print("Agent finished, but no final AIMessage found in the final state after stream completion.")
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Agent did not return a valid response (final AI message not found).")
+
+        print(f"--- Agent Stream Ended. Final Response: {final_message[:200]}... ---")
+
+        return AgentResponse(response=final_message, trace_events=trace_event_for_frontend)
+   
+    except Exception as e:
+        traceback.print_exc()  #* try -catch block me jo bhi exception aati hai uska pura traceback treminal pr red colour me print krta .traceback btata ki kis line pr error aaya ,kis fn ne us line ko call kra tha ,error ka type or message bhi btata
+        trace_deatais=f"Error during agent invocation :{e}"
+        print(trace_deatais)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail=f"Internal server error :{e}")
+#* only for testing
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
