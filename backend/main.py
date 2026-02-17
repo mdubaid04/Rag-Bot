@@ -17,8 +17,11 @@ import traceback
 app = FastAPI(
     title="LangGraph RAG Agent API",
     description="API for the LangGraph-powered RAG agent with Pinecone and Groq.",
-    version="1.0.0",
+    version="1.0.0"
 )
+@app.get('/')
+def hello():
+    return{'status':'hello'}
 
 # In-memory session manager for LangGraph checkpoints (for demonstration)
 memory = MemorySaver()
@@ -96,7 +99,7 @@ async def chat_with_agent(request:QueryRequest):
     try:
         #* passing session and web info to the config so that agent can access it
         config={
-            "configure":{
+            "configurable":{
                 "thread_id":request.session_id,
                 "enable_web_search":request.enable_web_search
             }
@@ -117,7 +120,8 @@ async def chat_with_agent(request:QueryRequest):
                 current_node_name='__end__'
                 node_output_state=s['__end__']
             else:
-                current_node_name=list[(s.keys())[0]] #8 s.keys() ek dict_keys object return krta hai i.e., dict_key(['retrieve])
+                current_node_name=list(s.keys())[0] 
+                #* s.keys() ek dict_keys object return krta hai i.e., dict_key(['retrieve])
                 node_output_state=s[current_node_name] 
             event_discription=f"Execution Node : {current_node_name}"
             event_details={}
