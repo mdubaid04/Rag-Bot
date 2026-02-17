@@ -10,3 +10,4 @@ wheels/
 .venv
 # environment file
 .env
+uv.lock
