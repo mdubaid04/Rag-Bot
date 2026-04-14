@@ -3,7 +3,7 @@
 import os
 from pinecone import Pinecone, ServerlessSpec
 from langchain_pinecone import PineconeVectorStore
-from langchain_pinecone import PineconeEmbeddings # Changed to HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings # Changed to HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Import API keys from config (only Pinecone is needed here now)
@@ -19,8 +19,7 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 # This will download the model the first time it's used.
 # The default model for HuggingFaceEmbeddings is 'sentence-transformers/all-MiniLM-L6-v2'
 # which has a dimension of 384.
-embeddings = PineconeEmbeddings(model="multilingual-e5-large")
-
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 # Define Pinecone index name
 INDEX_NAME = "langgraph-rag-index" # Make sure this matches your actual index name
