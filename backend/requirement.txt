@@ -3,7 +3,6 @@ langchain
 langchain-core
 langchain-community
 langchain-text-splitters
-sentence-transformers
 pypdf
 docx2txt
 unstructured
@@ -16,7 +15,6 @@ langchain-pinecone
 langchain-groq
 langchain-tavily
 requests 
-langchain-huggingface
 pydantic>=2.0
 httpx
 python-multipart
