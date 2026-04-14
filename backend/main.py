@@ -1,32 +1,106 @@
 # rag_agent_app/backend/main.py
 
 import os
-import time
-from typing import List, Dict, Any
+import uuid
+import traceback
+from typing import List, Dict, Any, Optional
 import tempfile
-from fastapi import FastAPI, HTTPException, status, UploadFile, File
-from pydantic import BaseModel, Field
+
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, EmailStr
+
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_community.document_loaders import PyPDFLoader
+from contextlib import asynccontextmanager
+
 from agent import rag_agent
 from vector_store import upload_doc
-import traceback
 
-# Initialize FastAPI app
+# ── Auth & DB imports ─────────────────────────────────────────
+from database import (
+    init_db,
+    create_user,
+    get_user_by_email,
+    create_or_update_session,
+    update_session_title,
+    get_user_sessions,
+    delete_session,
+    save_message,
+    get_session_messages,
+)
+from auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    get_optional_user,
+)
+
+# ── App setup ─────────────────────────────────────────────────
+
+
+
+memory = MemorySaver()
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+    init_db()
+    yield
+
 app = FastAPI(
     title="LangGraph RAG Agent API",
-    description="API for the LangGraph-powered RAG agent with Pinecone and Groq.",
-    version="1.0.0"
+    description="RAG agent with Pinecone, Groq, Auth & Chat History.",
+    version="2.0.0",
+    lifespan=lifespan
 )
-@app.get('/')
-def hello():
-    return{'status':'hello'}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # tighten in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# In-memory session manager for LangGraph checkpoints (for demonstration)
-memory = MemorySaver()
 
-# --- Pydantic Models for API ---
+
+
+# ═══════════════════════════════════════════════════════════════
+# Pydantic Schemas
+# ═══════════════════════════════════════════════════════════════
+
+class SignupRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=30)
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: int
+    username: str
+    email: str
+
+class UserProfile(BaseModel):
+    user_id: int
+    username: str
+    email: str
+
+class ChatSessionOut(BaseModel):
+    session_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+class MessageOut(BaseModel):
+    role: str
+    content: str
+    created_at: str
+
 class TraceEvent(BaseModel):
     step: int
     node_name: str
@@ -37,7 +111,7 @@ class TraceEvent(BaseModel):
 class QueryRequest(BaseModel):
     session_id: str
     query: str
-    enable_web_search: bool = True # NEW: Add web search toggle state
+    enable_web_search: bool = True
 
 class AgentResponse(BaseModel):
     response: str
@@ -48,162 +122,318 @@ class DocumentUploadResponse(BaseModel):
     filename: str
     processed_chunks: int
 
-# --- Document Upload Endpoint ---
+class DeleteSessionResponse(BaseModel):
+    message: str
+
+
+# ═══════════════════════════════════════════════════════════════
+# Health / Root
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/")
+def root():
+    return {"status": "hello", "version": "2.0.0"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Auth Endpoints
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/auth/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+def signup(req: SignupRequest):
+    """Register a new user."""
+    # Check duplicate email
+    if get_user_by_email(req.email):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists."
+        )
+
+    pw_hash = hash_password(req.password)
+    try:
+        user_id = create_user(req.username, req.email, pw_hash)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username already taken: {e}"
+        )
+
+    token = create_access_token(user_id, req.username)
+    return AuthResponse(
+        access_token=token,
+        user_id=user_id,
+        username=req.username,
+        email=req.email
+    )
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(req: LoginRequest):
+    """Login with email + password, returns JWT."""
+    user = get_user_by_email(req.email)
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password."
+        )
+
+    token = create_access_token(user["id"], user["username"])
+    return AuthResponse(
+        access_token=token,
+        user_id=user["id"],
+        username=user["username"],
+        email=user["email"]
+    )
+
+
+@app.get("/auth/me", response_model=UserProfile)
+def me(current_user: dict = Depends(get_current_user)):
+    """Returns the logged-in user's profile."""
+    return UserProfile(
+        user_id=current_user["id"],
+        username=current_user["username"],
+        email=current_user["email"]
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Chat History Endpoints
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/history/sessions", response_model=List[ChatSessionOut])
+def list_sessions(current_user: dict = Depends(get_current_user)):
+    """
+    Returns all chat sessions of the logged-in user (newest first).
+    Empty list if user has no sessions yet.
+    """
+    sessions = get_user_sessions(current_user["id"])
+    return [
+        ChatSessionOut(
+            session_id=s["session_id"],
+            title=s["title"],
+            created_at=s["created_at"],
+            updated_at=s["updated_at"]
+        )
+        for s in sessions
+    ]
+
+
+@app.get("/history/sessions/{session_id}/messages", response_model=List[MessageOut])
+def get_messages(session_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Returns all messages for a specific session.
+    Returns 403 if the session doesn't belong to this user.
+    """
+    # Verify ownership
+    user_sessions = get_user_sessions(current_user["id"])
+    owned_ids = {s["session_id"] for s in user_sessions}
+    if session_id not in owned_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to this session."
+        )
+
+    messages = get_session_messages(session_id)
+    return [
+        MessageOut(role=m["role"], content=m["content"], created_at=m["created_at"])
+        for m in messages
+    ]
+
+
+@app.delete("/history/sessions/{session_id}", response_model=DeleteSessionResponse)
+def delete_chat_session(session_id: str, current_user: dict = Depends(get_current_user)):
+    """Deletes a session and all its messages."""
+    deleted = delete_session(session_id, current_user["id"])
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or access denied."
+        )
+    return DeleteSessionResponse(message="Session deleted successfully.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Document Upload Endpoint
+# ═══════════════════════════════════════════════════════════════
+
 @app.post("/upload-document/", response_model=DocumentUploadResponse, status_code=status.HTTP_200_OK)
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Uploads a PDF document, extracts text, and adds it to the RAG knowledge base.
-    """
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)   # only logged-in users can upload
+):
+    """Uploads a PDF and indexes it into the RAG knowledge base."""
     if not file.filename.endswith(".pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only PDF files are supported."
         )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        file_content = await file.read()
-        tmp_file.write(file_content)
-        temp_file_path = tmp_file.name
-    
-    print(f"Received PDF for upload: {file.filename}. Saved temporarily to {temp_file_path}")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    print(f"[{current_user['username']}] Uploading: {file.filename}")
 
     try:
-        loader = PyPDFLoader(temp_file_path)
+        loader = PyPDFLoader(tmp_path)
         documents = loader.load()
-
-        total_chunks_added = 0
+        total_chunks = 0
         if documents:
-            full_text_content = "\n\n".join([doc.page_content for doc in documents])
-            total_chunks_added=upload_doc(full_text_content)
+            full_text = "\n\n".join(d.page_content for d in documents)
+            total_chunks = upload_doc(full_text)
+
         return DocumentUploadResponse(
-            message=f"PDF '{file.filename}' successfully uploaded and indexed.",
+            message=f"PDF '{file.filename}' uploaded and indexed successfully.",
             filename=file.filename,
-            processed_chunks=total_chunks_added
+            processed_chunks=total_chunks
         )
     except Exception as e:
-        print(f"Error processing PDF document: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process PDF: {e}"
-        )
+        print(f"Error processing PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
     finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-            print(f"Cleaned up temporary file: {temp_file_path}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
-@app.post('/chat/',response_model=AgentResponse)
-async def chat_with_agent(request:QueryRequest):
-    trace_event_for_frontend : List[TraceEvent] = []
+# ═══════════════════════════════════════════════════════════════
+# Chat Endpoint
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/chat/", response_model=AgentResponse)
+async def chat_with_agent(
+    request: QueryRequest,
+    current_user: Optional[dict] = Depends(get_optional_user)
+    # Optional: unauthenticated users can still chat, but history won't be saved
+):
+    trace_events: List[TraceEvent] = []
 
     try:
-        #* passing session and web info to the config so that agent can access it
-        config={
-            "configurable":{
-                "thread_id":request.session_id,
-                "enable_web_search":request.enable_web_search
+        config = {
+            "configurable": {
+                "thread_id": request.session_id,
+                "web_search_enabled": request.enable_web_search
             }
         }
-        inputs={"messages":[HumanMessage(content=request.query)]}
-        final_message=" "
+        inputs = {"messages": [HumanMessage(content=request.query)]}
+        final_message = " "
 
-        #* for server-side debugging--
-        print(f"Starting agent stream for session : {request.session_id}")
-        print(f"web_search_enable : {request.enable_web_search}")
+        print(f"Session: {request.session_id} | Web search: {request.enable_web_search}")
 
-        #* to track each step of agent here i= step and s= dictionary
-        for i,s in enumerate(rag_agent.stream(inputs,config=config)):
-            current_node_name=None
-            node_output_state=None
-
-            if '__end__' in s:
-                current_node_name='__end__'
-                node_output_state=s['__end__']
+        s = {}
+        for i, s in enumerate(rag_agent.stream(inputs, config=config)):
+            if "__end__" in s:
+                current_node = "__end__"
+                node_state = s["__end__"]
             else:
-                current_node_name=list(s.keys())[0] 
-                #* s.keys() ek dict_keys object return krta hai i.e., dict_key(['retrieve])
-                node_output_state=s[current_node_name] 
-            event_discription=f"Execution Node : {current_node_name}"
-            event_details={}
-            event_type="generic node execution"
-            if current_node_name == "router":
-                route_decision = node_output_state.get('route')
-                # Check for overridden route if web search was disabled
-                initial_decision = node_output_state.get('initial_router_decision', route_decision)
-                override_reason = node_output_state.get('router_override_reason', None)
+                current_node = list(s.keys())[0]
+                node_state = s[current_node]
 
+            event_description = f"Execution Node: {current_node}"
+            event_details: Dict[str, Any] = {}
+            event_type = "generic_node_execution"
+
+            if current_node == "router":
+                route_decision = node_state.get("route")
+                initial_decision = node_state.get("initial_router_decision", route_decision)
+                override_reason = node_state.get("router_override_reason")
                 if override_reason:
-                    event_description = f"Router initially decided: '{initial_decision}'. Overridden to: '{route_decision}' because {override_reason}."
-                    event_details = {"initial_decision": initial_decision, "final_decision": route_decision, "override_reason": override_reason}
+                    event_description = (
+                        f"Router initially decided: '{initial_decision}'. "
+                        f"Overridden to: '{route_decision}' because {override_reason}."
+                    )
+                    event_details = {
+                        "initial_decision": initial_decision,
+                        "final_decision": route_decision,
+                        "override_reason": override_reason
+                    }
                 else:
                     event_description = f"Router decided: '{route_decision}'"
-                    event_details = {"decision": route_decision, "reason": "Based on initial query analysis."}
+                    event_details = {"decision": route_decision}
                 event_type = "router_decision"
-            elif current_node_name == "rag_lookup":
-                rag_content_summary = node_output_state.get("rag", "")[:200] + "..."
-                
-                rag_sufficient = node_output_state.get("route") == "answer" 
-                
-                if rag_sufficient:
-                    event_description = f"RAG Lookup performed. Content found and deemed sufficient. Proceeding to answer."
-                    event_details = {"retrieved_content_summary": rag_content_summary, "sufficiency_verdict": "Sufficient"}
-                else:
-                    event_description = f"RAG Lookup performed. Content NOT sufficient. Diverting to web search."
-                    event_details = {"retrieved_content_summary": rag_content_summary, "sufficiency_verdict": "Not Sufficient"}
-                
+
+            elif current_node == "rag_lookup":
+                rag_summary = node_state.get("rag", "")[:200] + "..."
+                sufficient = node_state.get("route") == "answer"
+                event_description = (
+                    "RAG Lookup: content sufficient. Proceeding to answer."
+                    if sufficient else
+                    "RAG Lookup: content NOT sufficient. Diverting to web search."
+                )
+                event_details = {
+                    "retrieved_content_summary": rag_summary,
+                    "sufficiency_verdict": "Sufficient" if sufficient else "Not Sufficient"
+                }
                 event_type = "rag_action"
-            elif current_node_name == "web_search":
-                web_content_summary = node_output_state.get("web", "")[:200] + "..."
-                event_description = f"Web Search performed. Results retrieved. Proceeding to answer."
-                event_details = {"retrieved_content_summary": web_content_summary}
+
+            elif current_node == "web_search":
+                web_summary = node_state.get("web", "")[:200] + "..."
+                event_description = "Web Search performed. Proceeding to answer."
+                event_details = {"retrieved_content_summary": web_summary}
                 event_type = "web_action"
-            elif current_node_name == "answer":
+
+            elif current_node == "answer":
                 event_description = "Generating final answer using gathered context."
                 event_type = "answer_generation"
-            elif current_node_name == "__end__":
+
+            elif current_node == "__end__":
                 event_description = "Agent process completed."
                 event_type = "process_end"
 
-            trace_event_for_frontend.append(
+            trace_events.append(
                 TraceEvent(
                     step=i + 1,
-                    node_name=current_node_name,
+                    node_name=current_node,
                     description=event_description,
                     details=event_details,
                     event_type=event_type
                 )
             )
-            print(f"Streamed Event: Step {i+1} - Node: {current_node_name} - Desc: {event_description}")
-        
-         # Get the final state from the last yielded item in the stream
-        final_actual_state_dict = None
-        if s:
-            if '__end__' in s:
-                final_actual_state_dict = s['__end__']
-            else:
-                if list(s.keys()):
-                    final_actual_state_dict = s[list(s.keys())[0]]
+            print(f"Step {i+1} | Node: {current_node} | {event_description}")
 
-        if final_actual_state_dict and "messages" in final_actual_state_dict:
-            for msg in reversed(final_actual_state_dict["messages"]):
+        # Extract final AI message
+        final_state = None
+        if s:
+            final_state = s.get("__end__") or s.get(list(s.keys())[0])
+
+        if final_state and "messages" in final_state:
+            for msg in reversed(final_state["messages"]):
                 if isinstance(msg, AIMessage):
                     final_message = msg.content
                     break
-        
-        if not final_message:
-             print("Agent finished, but no final AIMessage found in the final state after stream completion.")
-             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Agent did not return a valid response (final AI message not found).")
 
-        print(f"--- Agent Stream Ended. Final Response: {final_message[:200]}... ---")
+        if not final_message.strip():
+            raise HTTPException(
+                status_code=500,
+                detail="Agent did not return a valid response."
+            )
 
-        return AgentResponse(response=final_message, trace_events=trace_event_for_frontend)
-   
+        # ── Save to history if user is logged in ──────────────────
+        if current_user:
+            user_id = current_user["id"]
+
+            # Create/update the session record
+            # Use first 60 chars of first user message as the session title
+            session_title = request.query[:60] + ("..." if len(request.query) > 60 else "")
+            create_or_update_session(user_id, request.session_id, title=session_title)
+
+            # Save user message
+            save_message(request.session_id, "user", request.query)
+
+            # Save assistant message
+            save_message(request.session_id, "assistant", final_message)
+
+            print(f"History saved for user '{current_user['username']}', session '{request.session_id}'")
+        else:
+            print("No user logged in — history not saved.")
+
+        return AgentResponse(response=final_message, trace_events=trace_events)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        traceback.print_exc()  #* try -catch block me jo bhi exception aati hai uska pura traceback treminal pr red colour me print krta .traceback btata ki kis line pr error aaya ,kis fn ne us line ko call kra tha ,error ka type or message bhi btata
-        trace_deatais=f"Error during agent invocation :{e}"
-        print(trace_deatais)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail=f"Internal server error :{e}")
-#* only for testing
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
