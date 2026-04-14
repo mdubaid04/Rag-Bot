@@ -11,3 +11,4 @@ wheels/
 # environment file
 .env
 uv.lock
+app_data.db
