@@ -16,5 +16,6 @@ langchain-pinecone
 langchain-groq
 langchain-tavily
 requests 
-uuid 
 langchain-huggingface
+pydantic>=2.0
+httpx
