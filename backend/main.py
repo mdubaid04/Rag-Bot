@@ -204,6 +204,6 @@ async def chat_with_agent(request:QueryRequest):
         print(trace_deatais)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail=f"Internal server error :{e}")
 #* only for testing
-@app.get("/Health")
+@app.get("/health")
 async def health_check():
     return {"status": "ok"}
