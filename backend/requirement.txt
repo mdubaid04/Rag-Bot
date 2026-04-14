@@ -19,3 +19,4 @@ requests
 langchain-huggingface
 pydantic>=2.0
 httpx
+python-multipart
