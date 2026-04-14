@@ -1,12 +1,11 @@
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
 def load_frontend_config():
-    """
-    Loads environment variables relevant to the frontend from the .env file.
-    Assumes .env is in the project root (one level up from frontend/).
-    """
-    load_dotenv()
+  # frontend folder ke andr .env dhoondega
+    env_path =Path(__file__).parent / ".env"
+    load_dotenv(dotenv_path=env_path)
     return {
         "FASTAPI_BASE_URL": os.getenv("FASTAPI_BASE_URL", "http://localhost:8000")
     }
