@@ -93,7 +93,6 @@ def get_current_user(
         )
     return user   # returns full user dict from DB
 
-
 def get_optional_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ) -> Optional[dict]:
@@ -106,5 +105,8 @@ def get_optional_user(
     payload = decode_token(credentials.credentials)
     if payload is None:
         return None
-    user_id = int(payload["sub"])
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, ValueError, TypeError):
+        return None
     return get_user_by_id(user_id)
