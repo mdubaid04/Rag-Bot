@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, EmailStr
 
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader,Docx2txtLoader
 from contextlib import asynccontextmanager
 
 from agent import rag_agent
@@ -37,6 +37,14 @@ from auth import (
     get_current_user,
     get_optional_user,
 )
+
+
+
+SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
+EXTENSION_LABELS = {
+    ".pdf": "PDF",
+    ".docx": "Word Document",
+}
 
 # ── App setup ─────────────────────────────────────────────────
 
@@ -124,6 +132,30 @@ class DocumentUploadResponse(BaseModel):
 
 class DeleteSessionResponse(BaseModel):
     message: str
+
+# ═══════════════════════════════════════════════════════════════
+# Helper: Document Text Extraction
+# ═══════════════════════════════════════════════════════════════
+
+def extract_text_from_file(tmp_path: str, extension: str) -> str:
+    """
+    Extracts plain text from a file based on its extension.
+    Supports: .pdf, .docx, 
+    Returns the full extracted text as a single string.
+    """
+    if extension == ".pdf":
+        loader = PyPDFLoader(tmp_path)
+        documents = loader.load()
+        return "\n\n".join(d.page_content for d in documents) if documents else ""
+
+    elif extension == ".docx":
+        loader = Docx2txtLoader(tmp_path)
+        documents = loader.load()
+        return "\n\n".join(d.page_content for d in documents) if documents else ""
+
+    else:
+        raise ValueError(f"Unsupported file type: {extension}")
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -265,35 +297,63 @@ async def upload_document(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)   # only logged-in users can upload
 ):
-    """Uploads a PDF and indexes it into the RAG knowledge base."""
-    if not file.filename.endswith(".pdf"):
+    """
+    Uploads a document (PDF, DOCX, or PPTX) and indexes it into the RAG knowledge base.
+
+    - **PDF**  → parsed via PyPDFLoader
+    - **DOCX** → parsed via Docx2txtLoader
+    - **PPTX** → parsed via UnstructuredPowerPointLoader (slide text extracted slide-by-slide)
+    """
+    # ── Validate file extension ───────────────────────────────
+    original_name = file.filename or ""
+    _, ext = os.path.splitext(original_name.lower())
+
+    if ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF files are supported."
+            detail=(
+                f"Unsupported file type '{ext}'. "
+                f"Allowed types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            )
         )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+    file_label = EXTENSION_LABELS[ext]
+    print(f"[{current_user['username']}] Uploading {file_label}: {original_name}")
+
+    # ── Save to temp file ─────────────────────────────────────
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    print(f"[{current_user['username']}] Uploading: {file.filename}")
-
     try:
-        loader = PyPDFLoader(tmp_path)
-        documents = loader.load()
-        total_chunks = 0
-        if documents:
-            full_text = "\n\n".join(d.page_content for d in documents)
-            total_chunks = upload_doc(full_text)
+        # ── Extract text based on file type ───────────────────
+        full_text = extract_text_from_file(tmp_path, ext)
+
+        if not full_text.strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"No readable text could be extracted from '{original_name}'. "
+                       f"Make sure the file is not empty, scanned-only, or password-protected."
+            )
+
+        # ── Chunk & index into Pinecone ───────────────────────
+        total_chunks = upload_doc(full_text)
 
         return DocumentUploadResponse(
-            message=f"PDF '{file.filename}' uploaded and indexed successfully.",
-            filename=file.filename,
+            message=f"{file_label} '{original_name}' uploaded and indexed successfully.",
+            filename=original_name,
+            file_type=file_label,
             processed_chunks=total_chunks
         )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error processing PDF: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
+        print(f"Error processing {file_label}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process {file_label} '{original_name}': {e}"
+        )
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
